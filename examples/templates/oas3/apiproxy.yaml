@@ -1,4 +1,4 @@
-#  Copyright 2025 Google LLC
+#  Copyright 2024 Google LLC
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -18,18 +18,41 @@ APIProxy:
   DisplayName: {{ $.Values.spec.info.title }}
   Description: |- 
     {{ $.Values.spec.info.description | nindent 4 }}
-Policies: {{ include "./policies.yaml" . | nindent 2 }}
+Policies: {{ include "./policies-adobe.yaml" . | nindent 5 }}
 ProxyEndpoints:
   - ProxyEndpoint:
-      .name: default
-      PreFlow:
-        .name: PreFlow
-        Request:
+      - .name: default
+      - DefaultFaultRule:
+          - .name: all
+          - AlwaysEnforce: true
+          #{{ if index $.Values.spec "x-proxy-default-fc-errorflow" }}
           - Step:
-              Name: Spike-Arrest
-          - Step:
-              Name: OAS-Validate
-      Flows:
+              Name: FC-ErrorFlow
+          #{{end}}
+
+      #{{- $proxy := dig "x-proxy" "" $.Values.spec }}
+      - PreFlow:
+          .name: PreFlow
+          Request:
+            #--Policies and conditions if any retrived from overlaid yaml or bypass--
+            #{{- range $policy := $proxy.PreFlow.Request.Policies }}
+            - Step:
+                Name: {{ $policy.name }}
+                #{{- if $policy.condition }}
+                Condition: {{ $policy.condition | quote }}
+                #{{- end }}
+            #{{- end }}
+
+          Response:
+            #--Policies and conditions if any retrived from overlaid yaml or bypass--
+            #{{- range $policy := $proxy.PreFlow.Response.Policies }}
+            - Step:
+                Name: {{ $policy.name }}
+                #{{- if $policy.condition }}
+                Condition: {{ $policy.condition | quote }}
+                #{{- end }}
+            #{{- end }}
+      - Flows:
       #{{- range $path, $pathItem := $.Values.spec.paths }}
         #{{- range $verb, $opItem := $pathItem }}
           #{{- if not (regexMatch "^(post|get|put|delete|trace|options|head|patch)$" $verb) }}
@@ -42,43 +65,209 @@ ProxyEndpoints:
           #{{-  end  }}
         - Flow:
             .name: {{ $opItem.operationId }}
+            Description: {{ $opItem.description }}
+            Request:
+            #--Policies and conditions if any retrived from overlaid yaml or bypass--
+            #{{- range $policy := $opItem.Request.Policies }}
+            - Step:
+                Name: {{ $policy.name }}
+                #{{- if $policy.condition }}
+                Condition: {{ $policy.condition | quote }}
+                #{{- end }}
+            #{{- end }}            
+            Response:
+            #--Policies and conditions if any retrived from overlaid yaml or bypass--
+            #{{- range $policy := $opItem.Response.Policies }}
+            - Step:
+                Name: {{ $policy.name }}
+                #{{- if $policy.condition }}
+                Condition: {{ $policy.condition | quote }}
+                #{{- end }}
+            #{{- end }}
             Condition: (proxy.pathsuffix MatchesPath "{{  regexReplaceAll "{[^}]*}" $path "*" }}") and (request.verb = "{{ $verb | upper }}")
         #{{- end }}
       #{{- end }}
-        - Flow:
-            .name: CatchAll
-            Request:
-              - Step:
-                  Name: RF-CatchAll
-      PostClientFlow:
-        .name: SamplePostClientFlow
-        Description: Processed after the response is sent back to the client.
-        Response:
-          Step:
-            Name: ML-Logging-OK
-      HTTPProxyConnection:
-        BasePath: {{ include "get_basepath" (index $.Values.spec.servers 0 "url") }}
-      RouteRule:
-        .name: default
-        TargetEndpoint: default
+      - PostFlow:
+          .name: PostFlow
+          Request:
+            #--Policies and conditions if any retrived from overlaid yaml or bypass--
+            #{{- range $policy := $proxy.PostFlow.Request.Policies }}
+            - Step:
+                Name: {{ $policy.name }}
+                #{{- if $policy.condition }}
+                Condition: {{ $policy.condition | quote }}
+                #{{- end }}
+            #{{- end }}
+
+          Response:
+            #--Policies and conditions if any or bypass retrived from overlaid yaml--
+            #{{- range $policy := $proxy.PostFlow.Response.Policies }}
+            - Step:
+                Name: {{ $policy.name }}
+                #{{- if $policy.condition }}
+                Condition: {{ $policy.condition | quote }}
+                #{{- end }}
+            #{{- end }}
+      - PostClientFlow:
+          .name: PostClientFlow
+          Description: Processed after the response is sent back to the client.
+          Request:
+          Response:
+          #{{ if index $.Values.spec "x-proxy-postcf-fc-splunk" }}
+            Step:
+              Name: FC-Splunk
+          #{{end}}
+      - HTTPProxyConnection:
+          BasePath: {{ $.Values.spec.basepath }}
+      #--Route and conditions if any retrived from overlaid yaml or bypass--
+      #{{- if $proxy.RouteRules }}
+      #{{- range $rr := $proxy.RouteRules }}
+      - RouteRule:
+          - .name: {{ index $rr "name" }}
+            {{- with index $rr "condition" }}
+          - Condition: {{ . }}
+            {{- end }}
+            {{- with index $rr "targetEndpoint" }}
+          - TargetEndpoint: {{ . }}
+            {{- end }}
+        {{- end }}
+        {{- end }}
+
+          
+# --- Dynamically create TargetEndpoints if x-targets exist ---
+
 TargetEndpoints:
+#--Take $endpoints like x-target-mcom, x-target-east,x-target-central etc--
+#{{- range $endpoints, $target := $.Values.spec }}
+  #--$target are LB, URL that are specified in overlaid--
+  #{{- if hasPrefix "x-target" $endpoints }}
+  #{{- if and $target (or $target.URL $target.LoadBalancer) }}
   - TargetEndpoint:
-      .name: default
+      .name: {{ $endpoints | replace "x-target-" "" }}  # e.g. "east", "central"
+      PreFlow:
+        .name: PreFlow
+        Request:
+            
+            #{{- range $policy := $target.PreFlow.Request.Policies }}
+            - Step:
+                Name: {{ $policy.name }}
+                #{{- if $policy.condition }}
+                Condition: {{ $policy.condition | quote }}
+                #{{- end }}
+            #{{- end }}
+
+        Response:
+            
+            #{{- range $policy := $target.PreFlow.Response.Policies }}
+            - Step:
+                Name: {{ $policy.name }}
+                #{{- if $policy.condition }}
+                Condition: {{ $policy.condition | quote }}
+                #{{- end }}
+            #{{- end }}
+      Flows: []
+      PostFlow:
+        .name: PostFlow
+        Request:
+            
+            #{{- range $policy := $target.PostFlow.Request.Policies }}
+            - Step:
+                Name: {{ $policy.name }}
+                #{{- if $policy.condition }}
+                Condition: {{ $policy.condition | quote }}
+                #{{- end }}
+            #{{- end }}
+
+        Response:
+            
+            #{{- range $policy := $target.PostFlow.Response.Policies }}
+            - Step:
+                Name: {{ $policy.name }}
+                #{{- if $policy.condition }}
+                Condition: {{ $policy.condition | quote }}
+                #{{- end }}
+            #{{- end }}
+
       HTTPTargetConnection:
-        #{{- $scheme := include "get_scheme" (index $.Values.spec.servers 0 "url") }}
-        #{{- if eq $scheme "https" }}
+        #{{- if $target.URL }}
+        URL: {{ $target.URL }}
+        #Include SSLInfo if defined in overlaid
+        #{{- if $target.SSLInfo }}
         SSLInfo:
-          Enabled: true
-          Enforce: true
-          IgnoreValidationErrors: true
+          Enabled: {{ $target.SSLInfo.Enabled | default " "}}
+          Enforce: {{ $target.SSLInfo.Enforce | default " "}}
+          ClientAuthEnabled: {{ $target.SSLInfo.ClientAuthEnabled | default " "}}
+          KeyStore: {{ $target.SSLInfo.KeyStore | default " "}}
+          KeyAlias: {{ $target.SSLInfo.KeyAlias | default " "}}
+          TrustStore: {{ $target.SSLInfo.TrustStore | default " "}}
+          IgnoreValidationErrors: {{ $target.SSLInfo.IgnoreValidationErrors | default " "}}
+          Protocols:
+            Protocol: {{ $target.SSLInfo.Protocols.Protocol | default " "}}
+            Protocol: TLSv1.3
+          Ciphers: {{ $target.SSLInfo.Ciphers | default " "}}
         #{{- end }}
-        URL: {{ include "get_target_url" $.Values.spec.servers }}
-Resources:
-  - Resource:
-      Type: oas
-      #{{ os_writefile "./openapi.yaml" $.Values.spec_string }}
-      #{{ remove_oas_extensions "./openapi.yaml" }}
-      Path: ./openapi.yaml
-  - Resource:
-      Type: properties
-      Path: ./resources/test.properties
+        #{{- else if $target.LoadBalancer }}
+        LoadBalancer:
+          Algorithm: {{ $target.LoadBalancer.Algorithm | default " " }}
+          IsFallback: {{ $target.LoadBalancer.IsFallback | default " " }}
+          #{{- range $server := $target.LoadBalancer.Server }}
+          Server:
+            .name: {{ index $server "name"  }}
+            {{- if $server.IsFallback }}
+            IsFallback: {{ $server.IsFallback }}
+            {{- end }}
+            #{{- if $server.weight }}
+            Weight: {{  index $server "weight" }}
+            #{{- end }}
+          #{{- end }}
+          #{{- end }}
+          # Add MaxFailures
+          {{- if $target.LoadBalancer.MaxFailures }}
+          MaxFailures: {{ $target.LoadBalancer.MaxFailures }}
+          {{- end }}
+
+          # Add ServerUnhealthyResponse list
+          {{- if $target.LoadBalancer.ServerUnhealthyResponse }}
+          ServerUnhealthyResponse:
+          {{- range $resp := $target.LoadBalancer.ServerUnhealthyResponse }}
+          - ResponseCode: "{{ $resp.ResponseCode }}"
+          {{- end }}
+          {{- end }}
+
+        Path: {{  $target.Path | default " "}}
+        # Always include HealthMonitor if defined in overlaid
+        #{{- if $target.HealthMonitor }}
+        HealthMonitor:
+          IsEnabled: {{ $target.HealthMonitor.IsEnabled | default " " }}
+          IntervalInSec: {{ $target.HealthMonitor.IntervalInSec | default " " }}
+          TimeoutInSec: {{ $target.HealthMonitor.TimeoutInSec | default " " }}
+          HTTPMonitor:
+            Request:
+              IsSSL: {{ $target.HealthMonitor.HTTPMonitor.Request.IsSSL | default " " }}
+              TrustAllSSL: {{ $target.HealthMonitor.HTTPMonitor.Request.TrustAllSSL | default "" }}
+              ConnectTimeoutInSec: {{ $target.HealthMonitor.HTTPMonitor.Request.ConnectTimeoutInSec | default " " }}
+              SocketReadTimeoutInSec: {{ $target.HealthMonitor.HTTPMonitor.Request.SocketReadTimeoutInSec | default " " }}
+              Port: {{ $target.HealthMonitor.HTTPMonitor.Request.Port | default " " }}
+              Verb: {{ $target.HealthMonitor.HTTPMonitor.Request.Verb | default " " }}
+              Path: {{ $target.HealthMonitor.HTTPMonitor.Request.Path | default " " }}
+              SuccessResponse:
+                #{{- range $code := $target.HealthMonitor.SuccessResponse }}
+                ResponseCode: "{{ $code }}"
+                #{{- end }}
+          SuccessResponse:
+              #{{- range $code := $target.HealthMonitor.HTTPMonitor.SuccessResponse }}
+              ResponseCode: "{{ $code }}"
+            #{{- end }}
+          #{{- end }}
+        #{{- end }}
+        #{{- if $target.Properties }}
+        Properties: 
+          #{{- range $property := $target.Properties.Property }}
+          Property:
+            .name: {{ $property.name }}
+            -Data: |-
+              {{ $property.Data }}
+          #{{- end }}
+        #{{- end }}
+  #{{- end }}
+#{{- end }}
